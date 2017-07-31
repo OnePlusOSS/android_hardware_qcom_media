@@ -128,6 +128,9 @@ extern "C" {
 #define SZ_4K 0x1000
 #define SZ_1M 0x100000
 
+#define PREFETCH_SIZE 0x12c00000 //300MB
+#define MAX_PREFETCH_RES 0x7E9000//3840x2160
+
 #define Log2(number, power)  { OMX_U32 temp = number; power = 0; while( (0 == (temp & 0x1)) &&  power < 16) { temp >>=0x1; power++; } }
 #define Q16ToFraction(q,num,den) { OMX_U32 power; Log2(q,power);  num = q >> power; den = 0x1 << (16 - power); }
 #define EXTRADATA_IDX(__num_planes) ((__num_planes) ? (__num_planes) - 1 : 0)
@@ -795,6 +798,7 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     memset(&m_client_hdr_info, 0, sizeof(DescribeHDRStaticInfoParams));
     memset(&m_internal_hdr_info, 0, sizeof(DescribeHDRStaticInfoParams));
     memset(&m_color_mdata, 0, sizeof(ColorMetaData));
+    memset(&m_pf_info, 0, sizeof(prefetch_info));
     m_demux_entries = 0;
     msg_thread_id = 0;
     async_thread_id = 0;
@@ -961,6 +965,10 @@ omx_vdec::~omx_vdec()
 {
     m_pmem_info = NULL;
     DEBUG_PRINT_HIGH("In OMX vdec Destructor");
+
+    if (secure_mode)
+        drainPrefetchedBuffers();
+
     if (msg_thread_created) {
         DEBUG_PRINT_HIGH("Signalling close to OMX Msg Thread");
         message_thread_stop = true;
@@ -1897,7 +1905,7 @@ void omx_vdec::process_event_cb(void *ctxt, unsigned char id)
                                         }
 
                                         if (pThis->secure_mode && pThis->m_cb.EventHandler && pThis->in_reconfig) {
-                                            pThis->prefetchNewBuffers();
+                                            pThis->prefetchNewBuffers(true);
                                         }
 
                                         if (pThis->m_cb.EventHandler) {
@@ -7974,6 +7982,9 @@ OMX_ERRORTYPE  omx_vdec::fill_this_buffer_proxy(
         return OMX_ErrorHardware;
     }
 
+    if (secure_mode)
+        prefetchNewBuffers(false);
+
     return OMX_ErrorNone;
 }
 
@@ -12376,11 +12387,13 @@ omx_vdec::allocate_color_convert_buf::allocate_color_convert_buf()
 {
     enabled = false;
     omx = NULL;
+    m_c2d_init_success = false;
     init_members();
     ColorFormat = OMX_COLOR_FormatMax;
     dest_format = YCbCr420P;
     m_c2d_width = 0;
     m_c2d_height = 0;
+    m_c2d_output_format = 0;
 }
 
 void omx_vdec::allocate_color_convert_buf::set_vdec_client(void *client)
@@ -12393,7 +12406,7 @@ void omx_vdec::allocate_color_convert_buf::init_members()
     allocated_count = 0;
     buffer_size_req = 0;
     buffer_alignment_req = 0;
-    m_c2d_width = m_c2d_height = 0;
+    m_c2d_width = m_c2d_height = m_c2d_output_format = 0;
     memset(m_platform_list_client,0,sizeof(m_platform_list_client));
     memset(m_platform_entry_client,0,sizeof(m_platform_entry_client));
     memset(m_pmem_info_client,0,sizeof(m_pmem_info_client));
@@ -12403,6 +12416,16 @@ void omx_vdec::allocate_color_convert_buf::init_members()
 #endif
     for (int i = 0; i < MAX_COUNT; i++)
         pmem_fd[i] = -1;
+
+    if (m_c2d_init_success)
+        return;
+
+    if (!c2d.init()) {
+        DEBUG_PRINT_ERROR("c2d init failed");
+    } else {
+        DEBUG_PRINT_HIGH("c2d init success ");
+        m_c2d_init_success = true;
+    }
 }
 
 omx_vdec::allocate_color_convert_buf::~allocate_color_convert_buf()
@@ -12426,6 +12449,15 @@ bool omx_vdec::allocate_color_convert_buf::update_buffer_req()
         DEBUG_PRINT_HIGH("No color conversion required");
         return status;
     }
+
+    bool skip_get_buffersize = (omx->drv_ctx.video_resolution.frame_height == m_c2d_height &&
+               omx->drv_ctx.video_resolution.frame_width == m_c2d_width && m_c2d_output_format == dest_format);
+
+    if (skip_get_buffersize) {
+        DEBUG_PRINT_HIGH("Skip querying c2d buffer size as resolution and format not changed");
+        return status;
+    }
+
     pthread_mutex_lock(&omx->c_lock);
 
     memset(&fmt, 0x0, sizeof(struct v4l2_format));
@@ -12479,6 +12511,7 @@ bool omx_vdec::allocate_color_convert_buf::update_buffer_req()
             buffer_size_req = destination_size;
             m_c2d_height = height;
             m_c2d_width = width;
+            m_c2d_output_format = dest_format;
         }
     }
 fail_update_buf_req:
@@ -12495,6 +12528,10 @@ bool omx_vdec::allocate_color_convert_buf::set_color_format(
     if (!omx) {
         DEBUG_PRINT_ERROR("Invalid client in color convert");
         return false;
+    }
+    if (!m_c2d_init_success) {
+        DEBUG_PRINT_HIGH("c2d is not initialized");
+        return status;
     }
     pthread_mutex_lock(&omx->c_lock);
     if (omx->drv_ctx.output_format == VDEC_YUV_FORMAT_NV12)
@@ -12537,18 +12574,18 @@ bool omx_vdec::allocate_color_convert_buf::set_color_format(
             ColorFormat = dest_color_format;
             dest_format = (dest_color_format == OMX_COLOR_FormatYUV420Planar) ?
                     YCbCr420P : YCbCr420SP;
-            if (enabled)
-                c2d.destroy();
-            enabled = false;
-            if (!c2d.init()) {
-                DEBUG_PRINT_ERROR("open failed for c2d");
-                status = false;
-            } else
+            c2d.close();
+            status = c2d.open(omx->drv_ctx.video_resolution.frame_height,
+                       omx->drv_ctx.video_resolution.frame_width,
+                       NV12_128m,dest_format);
+            if (status)
                 enabled = true;
+            else
+                DEBUG_PRINT_ERROR("C2D open failed ");
         }
     } else {
         if (enabled)
-            c2d.destroy();
+            c2d.close();
         enabled = false;
     }
     pthread_mutex_unlock(&omx->c_lock);
@@ -13296,109 +13333,107 @@ OMX_ERRORTYPE omx_vdec::describeColorFormat(OMX_PTR pParam) {
 #endif //FLEXYUV_SUPPORTED
 }
 
-void omx_vdec::prefetchNewBuffers() {
+void omx_vdec::prefetchNewBuffers(bool reconfig) {
+    size_t prefetch_size;
+    int rc = 0;
 
-    struct v4l2_decoder_cmd dec;
-    uint32_t prefetch_count;
-    uint32_t prefetch_size;
-    uint32_t want_size;
-    uint32_t have_size;
-    int color_fmt, rc;
-    uint32_t new_calculated_size;
-    uint32_t new_buffer_size;
-    uint32_t new_buffer_count;
-    uint32_t old_buffer_size;
-    uint32_t old_buffer_count;
-
-    memset((void *)&dec, 0 , sizeof(dec));
-    DEBUG_PRINT_LOW("Old size : %zu, count : %d, width : %u, height : %u\n",
-            drv_ctx.op_buf.buffer_size, drv_ctx.op_buf.actualcount,
-            drv_ctx.video_resolution.frame_width,
-            drv_ctx.video_resolution.frame_height);
-    dec.cmd = V4L2_DEC_QCOM_CMD_RECONFIG_HINT;
-    if (ioctl(drv_ctx.video_driver_fd, VIDIOC_DECODER_CMD, &dec)) {
-        DEBUG_PRINT_ERROR("Buffer info cmd failed : %d\n", errno);
-    } else {
-        DEBUG_PRINT_LOW("From driver, new size is %d, count is %d\n",
-                dec.raw.data[0], dec.raw.data[1]);
-    }
-
-    switch ((int)drv_ctx.output_format) {
-    case VDEC_YUV_FORMAT_NV12:
-        color_fmt = COLOR_FMT_NV12;
-        break;
-    case VDEC_YUV_FORMAT_NV12_UBWC:
-        color_fmt = COLOR_FMT_NV12_UBWC;
-        break;
-    case VDEC_YUV_FORMAT_NV12_TP10_UBWC:
-        color_fmt = COLOR_FMT_NV12_BPP10_UBWC;
-        break;
-    default:
-        color_fmt = -1;
-        DEBUG_PRINT_HIGH("Color format : %x not supported for secure memory prefetching\n", drv_ctx.output_format);
+    if (reconfig) {
+        m_pf_info.pf_skip_count = 0;
         return;
     }
 
-    new_calculated_size = VENUS_BUFFER_SIZE(color_fmt, m_reconfig_width, m_reconfig_height);
-    DEBUG_PRINT_LOW("New calculated size for width : %d, height : %d, is %d\n",
-            m_reconfig_width, m_reconfig_height, new_calculated_size);
-    new_buffer_size = (dec.raw.data[0] > new_calculated_size) ? dec.raw.data[0] : new_calculated_size;
-    new_buffer_count = dec.raw.data[1];
-    old_buffer_size = drv_ctx.op_buf.buffer_size;
-    old_buffer_count = drv_ctx.op_buf.actualcount;
+    if (drv_ctx.video_resolution.frame_width * drv_ctx.video_resolution.frame_height >= MAX_PREFETCH_RES)
+        m_pf_info.no_more_pf = true;
 
-    new_buffer_count = old_buffer_count > new_buffer_count ? old_buffer_count : new_buffer_count;
+    if (m_pf_info.pf_size >= PREFETCH_SIZE || m_pf_info.no_more_pf)
+        return;
 
-    prefetch_count = new_buffer_count;
-    prefetch_size = new_buffer_size - old_buffer_size;
-    want_size = new_buffer_size * new_buffer_count;
-    have_size = old_buffer_size * old_buffer_count;
+    m_pf_info.pf_skip_count++;
 
-    if (want_size > have_size) {
-        DEBUG_PRINT_LOW("Want: %d, have : %d\n", want_size, have_size);
-        DEBUG_PRINT_LOW("prefetch_count: %d, prefetch_size : %d\n", prefetch_count, prefetch_size);
+    if (m_pf_info.pf_skip_count < drv_ctx.op_buf.actualcount)
+        return;
 
-        int ion_fd = open(MEM_DEVICE, O_RDONLY);
-        if (ion_fd < 0) {
-            DEBUG_PRINT_ERROR("Ion fd open failed : %d\n", ion_fd);
-            return;
-        }
+    int ion_fd = open(MEM_DEVICE, O_RDONLY);
+    if (ion_fd < 0) {
+        DEBUG_PRINT_ERROR("Ion fd open failed : %d\n", ion_fd);
+        return;
+    }
 
-        struct ion_custom_data *custom_data = (struct ion_custom_data*) malloc(sizeof(*custom_data));
-        struct ion_prefetch_data *prefetch_data = (struct ion_prefetch_data*) malloc(sizeof(*prefetch_data));
-        struct ion_prefetch_regions *regions = (struct ion_prefetch_regions*) malloc(sizeof(*regions));
-        size_t *sizes = (size_t*) malloc(sizeof(size_t) * prefetch_count);
+    struct ion_custom_data *custom_data = (struct ion_custom_data*) malloc(sizeof(*custom_data));
+    struct ion_prefetch_data *prefetch_data = (struct ion_prefetch_data*) malloc(sizeof(*prefetch_data));
+    struct ion_prefetch_regions *regions = (struct ion_prefetch_regions*) malloc(sizeof(*regions));
 
-        if (custom_data == NULL || prefetch_data == NULL || regions == NULL || sizes == NULL) {
-            DEBUG_PRINT_ERROR("prefetch data allocation failed");
-            goto prefetch_exit;
-        }
+    if (custom_data == NULL || prefetch_data == NULL || regions == NULL) {
+        DEBUG_PRINT_ERROR("prefetch data allocation failed");
+        goto prefetch_exit;
+    }
 
-        for (uint32_t i = 0; i < prefetch_count; i++) {
-            sizes[i] = prefetch_size;
-        }
+    prefetch_size = 4096 * 16 * 2; //assuming page order 4 blocks to be easily available for allocation
+    regions[0].nr_sizes = 1;
+    regions[0].sizes = &prefetch_size;
+    regions[0].vmid = ION_FLAG_CP_PIXEL;
+    prefetch_data->nr_regions = 1;
+    prefetch_data->regions = regions;
+    prefetch_data->heap_id = ION_HEAP(ION_SECURE_HEAP_ID);
 
-        regions[0].nr_sizes = prefetch_count;
-        regions[0].sizes = sizes;
-        regions[0].vmid = ION_FLAG_CP_PIXEL;
-
-        prefetch_data->nr_regions = 1;
-        prefetch_data->regions = regions;
-        prefetch_data->heap_id = ION_HEAP(ION_SECURE_HEAP_ID);
-
-        custom_data->cmd = ION_IOC_PREFETCH;
-        custom_data->arg = (unsigned long )prefetch_data;
-
-        rc = ioctl(ion_fd, ION_IOC_CUSTOM, custom_data);
-        if (rc) {
-            DEBUG_PRINT_ERROR("Custom prefetch ioctl failed rc : %d, errno : %d\n", rc, errno);
-        }
+    custom_data->cmd = ION_IOC_PREFETCH;
+    custom_data->arg = (unsigned long )prefetch_data;
+    rc = ioctl(ion_fd, ION_IOC_CUSTOM, custom_data);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Custom prefetch ioctl failed rc : %d, errno : %d\n", rc, errno);
+    } else {
+        m_pf_info.pf_size += prefetch_size;
+        DEBUG_PRINT_LOW("prefetch_size : %zu total prefetched size %zu\n", prefetch_size, m_pf_info.pf_size);
+    }
 
 prefetch_exit:
-        close(ion_fd);
-        free(sizes);
-        free(regions);
-        free(prefetch_data);
-        free(custom_data);
+    close(ion_fd);
+    free(regions);
+    free(prefetch_data);
+    free(custom_data);
+}
+
+void omx_vdec::drainPrefetchedBuffers() {
+    int rc = 0;
+
+    int ion_fd = open(MEM_DEVICE, O_RDONLY);
+    if (ion_fd < 0) {
+        DEBUG_PRINT_ERROR("Ion fd open failed : %d\n", ion_fd);
+        return;
     }
+
+    struct ion_custom_data *custom_data = (struct ion_custom_data*) malloc(sizeof(*custom_data));
+    struct ion_prefetch_data *prefetch_data = (struct ion_prefetch_data*) malloc(sizeof(*prefetch_data));
+    struct ion_prefetch_regions *regions = (struct ion_prefetch_regions*) malloc(sizeof(*regions));
+
+    if (custom_data == NULL || prefetch_data == NULL || regions == NULL) {
+        DEBUG_PRINT_ERROR("drain data allocation failed");
+        goto drain_exit;
+    }
+    DEBUG_PRINT_LOW("drain size : %zu\n",  m_pf_info.pf_size);
+    regions[0].nr_sizes = 1;
+    regions[0].sizes = &(m_pf_info.pf_size);
+    regions[0].vmid = ION_FLAG_CP_PIXEL;
+
+    prefetch_data->nr_regions = 1;
+    prefetch_data->regions = regions;
+    prefetch_data->heap_id = ION_HEAP(ION_SECURE_HEAP_ID);
+
+    custom_data->cmd = ION_IOC_DRAIN;
+    custom_data->arg = (unsigned long )prefetch_data;
+
+    rc = ioctl(ion_fd, ION_IOC_CUSTOM, custom_data);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Custom drain ioctl failed rc : %d, errno : %d\n", rc, errno);
+    } else {
+        m_pf_info.pf_size = 0;
+        m_pf_info.pf_skip_count = 0;
+        m_pf_info.no_more_pf = false;
+    }
+
+drain_exit:
+    close(ion_fd);
+    free(regions);
+    free(prefetch_data);
+    free(custom_data);
 }
