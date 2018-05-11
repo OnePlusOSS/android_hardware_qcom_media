@@ -117,7 +117,7 @@ ifeq ($(call is-board-platform-in-list, $(TARGETS_THAT_NEED_SW_VENC_MPEG4)),true
 
 include $(CLEAR_VARS)
 
-libmm-venc-inc      += $(TARGET_OUT_HEADERS)/mm-video/swvenc
+libmm-venc-inc      += hardware/qcom/media/mm-video-v4l2/vidc/venc/inc/mm-video/swvenc
 
 LOCAL_MODULE                    := libOmxSwVencMpeg4
 

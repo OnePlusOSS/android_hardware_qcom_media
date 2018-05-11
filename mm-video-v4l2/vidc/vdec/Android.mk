@@ -153,7 +153,7 @@ LOCAL_SHARED_LIBRARIES        += libswvdec
 LOCAL_SRC_FILES               := src/omx_swvdec.cpp
 LOCAL_SRC_FILES               += src/omx_swvdec_utils.cpp
 
-include $(BUILD_SHARED_LIBRARY)
+#include $(BUILD_SHARED_LIBRARY)
 endif
 endif
 
